@@ -1,0 +1,146 @@
+version: "3.9"
+
+# ──────────────────────────────────────────────────────────────
+# Travel MLOps – Docker Compose Stack
+#
+# Services:
+#   travel-api      Flask prediction API
+#   mlflow-server   MLflow experiment tracking UI
+#   airflow-web     Airflow web UI
+#   airflow-sched   Airflow scheduler
+#   postgres        Shared metadata DB (MLflow + Airflow)
+# ──────────────────────────────────────────────────────────────
+
+networks:
+  mlops-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  mlflow-artifacts:
+  airflow-logs:
+
+services:
+
+  # ── PostgreSQL (shared metadata store) ────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: travel-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     mlops
+      POSTGRES_PASSWORD: mlops_secret
+      POSTGRES_DB:       mlops_db
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - mlops-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlops"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MLflow Tracking Server ─────────────────────────────────
+  mlflow-server:
+    image: ghcr.io/mlflow/mlflow:v2.11.3
+    container_name: travel-mlflow
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://mlops:mlops_secret@postgres:5432/mlops_db
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlflow/artifacts
+    volumes:
+      - mlflow-artifacts:/mlflow/artifacts
+    ports:
+      - "5001:5000"
+    networks:
+      - mlops-net
+    command: >
+      mlflow server
+        --backend-store-uri postgresql://mlops:mlops_secret@postgres:5432/mlops_db
+        --default-artifact-root /mlflow/artifacts
+        --host 0.0.0.0
+        --port 5000
+
+  # ── Travel ML API ──────────────────────────────────────────
+  travel-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: travel-api
+    restart: unless-stopped
+    depends_on:
+      - mlflow-server
+    environment:
+      MODEL_DIR:    /app/models/artifacts
+      PORT:         5000
+      MLFLOW_TRACKING_URI: http://mlflow-server:5000
+    volumes:
+      - ../models/artifacts:/app/models/artifacts:ro
+    ports:
+      - "5000:5000"
+    networks:
+      - mlops-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Apache Airflow ─────────────────────────────────────────
+  airflow-init:
+    image: apache/airflow:2.9.0
+    container_name: travel-airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://mlops:mlops_secret@postgres:5432/mlops_db
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    networks:
+      - mlops-net
+    entrypoint: /bin/bash
+    command: -c "airflow db migrate && airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin"
+
+  airflow-web:
+    image: apache/airflow:2.9.0
+    container_name: travel-airflow-web
+    restart: unless-stopped
+    depends_on:
+      - airflow-init
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://mlops:mlops_secret@postgres:5432/mlops_db
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags:ro
+      - airflow-logs:/opt/airflow/logs
+    ports:
+      - "8080:8080"
+    networks:
+      - mlops-net
+    command: webserver
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.0
+    container_name: travel-airflow-scheduler
+    restart: unless-stopped
+    depends_on:
+      - airflow-init
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://mlops:mlops_secret@postgres:5432/mlops_db
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags:ro
+      - airflow-logs:/opt/airflow/logs
+    networks:
+      - mlops-net
+    command: scheduler

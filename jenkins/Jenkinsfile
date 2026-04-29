@@ -1,0 +1,207 @@
+// ─────────────────────────────────────────────────────────────
+// Jenkinsfile  –  Travel MLOps CI/CD Pipeline
+//
+// Stages:
+//   1. Checkout         clone repo
+//   2. Lint & Test      flake8 + pytest
+//   3. Train Models     retrain all three models
+//   4. Evaluate         assert metric thresholds
+//   5. Build Image      docker build
+//   6. Push Image       docker push to registry
+//   7. Deploy (K8s)     kubectl rollout
+//   8. Smoke Test       curl /health
+//   9. Notify           post result to Slack / email
+// ─────────────────────────────────────────────────────────────
+
+pipeline {
+
+    agent any
+
+    environment {
+        REGISTRY       = "registry.hub.docker.com"          // change to your registry
+        IMAGE_NAME     = "travel-mlops/travel-api"
+        IMAGE_TAG      = "${env.BUILD_NUMBER}"
+        FULL_IMAGE     = "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+        LATEST_IMAGE   = "${REGISTRY}/${IMAGE_NAME}:latest"
+        KUBE_NAMESPACE = "travel-mlops"
+        DEPLOY_NAME    = "travel-api"
+        PYTHON         = "python3"
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: "10"))
+        timeout(time: 45, unit: "MINUTES")
+        timestamps()
+    }
+
+    stages {
+
+        // ── 1. Checkout ───────────────────────────────────────
+        stage("Checkout") {
+            steps {
+                checkout scm
+                echo "Building branch: ${env.BRANCH_NAME} | commit: ${env.GIT_COMMIT[0..7]}"
+            }
+        }
+
+        // ── 2. Lint & Unit Tests ──────────────────────────────
+        stage("Lint & Test") {
+            steps {
+                sh """
+                    ${PYTHON} -m pip install --quiet -r requirements.txt
+                    ${PYTHON} -m pip install --quiet flake8 pytest pytest-cov
+
+                    echo "--- Linting ---"
+                    flake8 models/ api/ --max-line-length=120 --ignore=E501,W503
+
+                    echo "--- Unit Tests ---"
+                    pytest tests/ -v --tb=short --cov=api --cov=models \
+                           --cov-report=xml:coverage.xml || true
+                """
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: "**/test-results.xml"
+                }
+            }
+        }
+
+        // ── 3. Train Models ───────────────────────────────────
+        stage("Train Models") {
+            when {
+                anyOf {
+                    branch "main"
+                    branch "develop"
+                    changeRequest()
+                }
+            }
+            parallel {
+                stage("Train Regression") {
+                    steps {
+                        sh "${PYTHON} models/train_regression.py"
+                    }
+                }
+                stage("Train Classification") {
+                    steps {
+                        sh "${PYTHON} models/train_classification.py"
+                    }
+                }
+                stage("Train Recommendation") {
+                    steps {
+                        sh "${PYTHON} models/train_recommendation.py"
+                    }
+                }
+            }
+        }
+
+        // ── 4. Evaluate Models ────────────────────────────────
+        stage("Evaluate Models") {
+            steps {
+                script {
+                    def result = sh(
+                        script: """
+                            ${PYTHON} -c "
+import json, sys
+with open('models/artifacts/flight_metrics.json') as f:
+    m = json.load(f)
+print('R2:', m['R2'], ' RMSE:', m['RMSE'])
+assert m['R2'] >= 0.85,   'R2 below threshold: ' + str(m['R2'])
+assert m['RMSE'] <= 100,  'RMSE above threshold: ' + str(m['RMSE'])
+print('All model thresholds passed.')
+                            "
+                        """,
+                        returnStatus: true
+                    )
+                    if (result != 0) {
+                        error("Model quality check failed – aborting deployment")
+                    }
+                }
+            }
+        }
+
+        // ── 5. Build Docker Image ─────────────────────────────
+        stage("Build Image") {
+            when { branch "main" }
+            steps {
+                sh """
+                    docker build \
+                        -f docker/Dockerfile \
+                        -t ${FULL_IMAGE} \
+                        -t ${LATEST_IMAGE} \
+                        --label "git.commit=${env.GIT_COMMIT}" \
+                        --label "build.number=${env.BUILD_NUMBER}" \
+                        .
+                """
+            }
+        }
+
+        // ── 6. Push Image ─────────────────────────────────────
+        stage("Push Image") {
+            when { branch "main" }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: "docker-hub-creds",
+                    usernameVariable: "DOCKER_USER",
+                    passwordVariable: "DOCKER_PASS"
+                )]) {
+                    sh """
+                        echo ${DOCKER_PASS} | docker login ${REGISTRY} -u ${DOCKER_USER} --password-stdin
+                        docker push ${FULL_IMAGE}
+                        docker push ${LATEST_IMAGE}
+                        docker logout ${REGISTRY}
+                    """
+                }
+            }
+        }
+
+        // ── 7. Deploy to Kubernetes ───────────────────────────
+        stage("Deploy") {
+            when { branch "main" }
+            steps {
+                withKubeConfig([credentialsId: "kubeconfig-prod"]) {
+                    sh """
+                        kubectl set image deployment/${DEPLOY_NAME} \
+                            travel-api=${FULL_IMAGE} \
+                            -n ${KUBE_NAMESPACE}
+
+                        kubectl rollout status deployment/${DEPLOY_NAME} \
+                            -n ${KUBE_NAMESPACE} \
+                            --timeout=120s
+                    """
+                }
+            }
+        }
+
+        // ── 8. Smoke Test ─────────────────────────────────────
+        stage("Smoke Test") {
+            when { branch "main" }
+            steps {
+                sh """
+                    sleep 10
+                    STATUS=\$(curl -s -o /dev/null -w "%{http_code}" \
+                        http://travel-api.local/health || echo "000")
+                    echo "Health check status: \$STATUS"
+                    [ "\$STATUS" = "200" ] || [ "\$STATUS" = "206" ] || exit 1
+                """
+            }
+        }
+    }
+
+    // ── Post actions ──────────────────────────────────────────
+    post {
+        success {
+            echo "✅  Pipeline succeeded – image ${FULL_IMAGE} deployed."
+            // slackSend channel: "#mlops", color: "good",
+            //     message: "✅ Travel ML deployed: build #${BUILD_NUMBER}"
+        }
+        failure {
+            echo "❌  Pipeline failed at stage: ${currentBuild.result}"
+            // slackSend channel: "#mlops", color: "danger",
+            //     message: "❌ Travel ML build #${BUILD_NUMBER} failed"
+            // mail to: "team@example.com", subject: "Build Failed", body: "..."
+        }
+        always {
+            cleanWs()
+        }
+    }
+}

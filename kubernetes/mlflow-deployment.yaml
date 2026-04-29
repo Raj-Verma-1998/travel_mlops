@@ -1,0 +1,81 @@
+# ──────────────────────────────────────────────────────────────
+# mlflow-deployment.yaml
+# MLflow Tracking Server on Kubernetes
+# ──────────────────────────────────────────────────────────────
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mlflow-artifacts-pvc
+  namespace: travel-mlops
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: standard
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow-server
+  namespace: travel-mlops
+  labels:
+    app: mlflow-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflow-server
+  template:
+    metadata:
+      labels:
+        app: mlflow-server
+    spec:
+      containers:
+        - name: mlflow
+          image: ghcr.io/mlflow/mlflow:v2.11.3
+          command:
+            - mlflow
+            - server
+            - --backend-store-uri
+            - "sqlite:///mlflow/mlflow.db"
+            - --default-artifact-root
+            - /mlflow/artifacts
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "5000"
+          ports:
+            - containerPort: 5000
+          resources:
+            requests:
+              cpu:    "200m"
+              memory: "256Mi"
+            limits:
+              cpu:    "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: mlflow-storage
+              mountPath: /mlflow
+      volumes:
+        - name: mlflow-storage
+          persistentVolumeClaim:
+            claimName: mlflow-artifacts-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow-service
+  namespace: travel-mlops
+spec:
+  selector:
+    app: mlflow-server
+  ports:
+    - port:       5000
+      targetPort: 5000
+  type: ClusterIP

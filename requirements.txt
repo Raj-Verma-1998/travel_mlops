@@ -1,0 +1,26 @@
+# ── Core ML ────────────────────────────────────────────────────
+pandas
+numpy
+scikit-learn
+xgboost
+joblib
+
+# ── API ─────────────────────────────────────────────────────────
+flask
+gunicorn
+
+# ── MLOps ───────────────────────────────────────────────────────
+mlflow
+apache-airflow
+# ── Visualisation / Dashboard ──────────────────────────────────
+streamlit
+plotly
+
+# ── Testing ─────────────────────────────────────────────────────
+pytest
+pytest-cov
+flake8
+
+# ── Utilities ───────────────────────────────────────────────────
+python-dotenv
+requests

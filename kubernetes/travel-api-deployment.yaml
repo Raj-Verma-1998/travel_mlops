@@ -1,0 +1,179 @@
+# ──────────────────────────────────────────────────────────────
+# travel-api-deployment.yaml
+# Kubernetes manifests for the Travel ML API
+#
+# Apply with:
+#   kubectl apply -f kubernetes/
+# ──────────────────────────────────────────────────────────────
+
+---
+# ── Namespace ─────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: travel-mlops
+  labels:
+    app: travel-mlops
+
+---
+# ── ConfigMap (non-secret env vars) ───────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: travel-api-config
+  namespace: travel-mlops
+data:
+  MODEL_DIR: "/app/models/artifacts"
+  PORT:      "5000"
+  MLFLOW_TRACKING_URI: "http://mlflow-service:5000"
+
+---
+# ── Deployment ────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: travel-api
+  namespace: travel-mlops
+  labels:
+    app: travel-api
+    version: "1.0.0"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: travel-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge:       1
+      maxUnavailable: 0          # zero-downtime deploys
+  template:
+    metadata:
+      labels:
+        app: travel-api
+    spec:
+      containers:
+        - name: travel-api
+          image: travel-mlops/travel-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: travel-api-config
+          resources:
+            requests:
+              cpu:    "250m"
+              memory: "512Mi"
+            limits:
+              cpu:    "1000m"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds:       10
+            failureThreshold:    3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds:       20
+            failureThreshold:    3
+          volumeMounts:
+            - name: model-artifacts
+              mountPath: /app/models/artifacts
+              readOnly: true
+      volumes:
+        - name: model-artifacts
+          persistentVolumeClaim:
+            claimName: model-artifacts-pvc
+
+---
+# ── Service (ClusterIP) ────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: travel-api-service
+  namespace: travel-mlops
+  labels:
+    app: travel-api
+spec:
+  selector:
+    app: travel-api
+  ports:
+    - name:       http
+      port:       80
+      targetPort: 5000
+      protocol:   TCP
+  type: ClusterIP
+
+---
+# ── Ingress ────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: travel-api-ingress
+  namespace: travel-mlops
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: travel-api.local
+      http:
+        paths:
+          - path:     /
+            pathType: Prefix
+            backend:
+              service:
+                name: travel-api-service
+                port:
+                  number: 80
+
+---
+# ── Horizontal Pod Autoscaler ──────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: travel-api-hpa
+  namespace: travel-mlops
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind:       Deployment
+    name:       travel-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type:               Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type:               Utilization
+          averageUtilization: 75
+
+---
+# ── PersistentVolumeClaim for model artifacts ──────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-artifacts-pvc
+  namespace: travel-mlops
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: standard
